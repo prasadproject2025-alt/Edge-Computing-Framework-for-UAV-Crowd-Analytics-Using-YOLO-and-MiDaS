@@ -6,6 +6,7 @@ import math
 from ultralytics import YOLO
 import tflite_runtime.interpreter as tflite
 
+
 # --- Configuration & Thresholds ---
 MIDAS_MODEL_PATH = "midas_v2_1_small.tflite"
 YOLO_MODEL_PATH = "yolo11n.pt"
