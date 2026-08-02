@@ -1,63 +1,62 @@
-# Edge-Based UAV Crowd Analytics
+## YOLO Object Detection with Intels'MiDaS Depth
 
-This project demonstrates a lightweight crowd-monitoring pipeline for UAV footage that combines person detection with depth-based spatial analysis. It is designed for edge hardware such as a Raspberry Pi, but it also includes a built-in demo mode so it can run on a regular desktop machine without downloading heavyweight models.
+This project integrates real-time object detection using YOLO models with depth estimation provided by Intel's MiDaS. 
+It enables detection and localization of objects in 3D space, enhancing understanding beyond traditional 2D bounding boxes. 
+Ideal for Robotics, ADAS, and surveillance applications, it provides an intuitive top-down view of detected objects and their relative distances.
 
-## Features
-- Person detection with YOLO if a YOLO weights file is available
-- Fallback person detection with OpenCV HOG when YOLO is unavailable
-- Depth estimation using a MiDaS TFLite model if the model file exists
-- Fallback synthetic depth estimation for offline/demo use
-- Spatial density analysis that highlights crowded regions and raises an alert
-- Demo mode for immediate testing without a camera
+![demo](output_video_depth_output_pip_.gif)
 
-## Project structure
-- main.py: complete runnable pipeline
-- requirements.txt: Python dependencies
-- tests/test_density.py: small regression tests for the crowd-density logic
+### Features
 
-## Installation
-On Windows or Linux, install the dependencies with:
+- Real-time object detection using the YOLO models.
+- Detection of various objects.
+- Leverages Intel's MiDaS for depth information, transforming 2D detections into spatially aware 3D data.
+- depth infos maps in real time.
+- Customizable confidence threshold and class filtering.
+- Simulated environment provides an intuitive top-down view of object positions and movements.
+- Easy integration with pre-trained YOLO models.
+- Provides bounding box coordinates, class labels, and tracking IDs for detected objects.
+
+### Prerequisites
+
+- Python 3.x
+- OpenCV
+- PyTorch
+- NumPy
+- Ultralytics
+
+### Installation
+
+1. Clone this repository.
+2. Install the required dependencies
 
 ```bash
-pip install -r requirements.txt
+pip3 install ultralytics timm six
 ```
 
-If you want to use the YOLO and MiDaS paths exactly as described in the paper, install:
+### Usage
+
+1. Download pre-trained YOLOv5 weights or train your own model.
+2. Provide the path to the YOLOv5 weights in the code.
+3. Run the script with the video file.
+4. View the object detection results and Bird's Eye View visualization.
+
+For more detailed usage instructions and options, refer to the project documentation.
+
+### Run
 
 ```bash
-pip install ultralytics tflite-runtime
+python3 main.py
 ```
 
-## Run
-### Demo mode (works immediately)
-```bash
-python main.py --source demo --max-frames 20 --no-display
-```
+### Contributing
 
-### Webcam mode
-```bash
-python main.py --source 0
-```
+Contributions are welcome! If you find any issues or have suggestions for improvements, please open an issue or submit a pull request.
 
-### Video file mode
-```bash
-python main.py --source path/to/video.mp4
-```
+### References
 
-### Save output to a file
-```bash
-python main.py --source demo --output outputs/videos/crowd_demo.mp4 --max-frames 50 --no-display
-```
+* [Ultralytics YOLO](https://github.com/ultralytics)
+* [Intel MiDaS](https://github.com/isl-org/MiDaS)
 
-## Notes
-- The project uses a simple spatial-density heuristic based on person bounding boxes and depth values.
-- If YOLO or MiDaS weights are absent, the app automatically switches to fallback methods so that the application remains runnable.
-- To use the full paper-style pipeline, place your YOLO weights at yolo11n.pt and your MiDaS model as midas_v2_1_small.tflite in the project folder.
- - Recommended output folder: use `outputs/videos/` to keep recordings separate from source.
-	 Create it with `mkdir -p outputs/videos` (or `mkdir outputs\videos` on Windows) before running, or pass `--output` and the script will create parent folders automatically.
 
-## Testing
-```bash
-pytest -q
-```
-
+### License

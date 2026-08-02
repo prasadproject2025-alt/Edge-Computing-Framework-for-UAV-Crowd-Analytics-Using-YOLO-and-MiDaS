@@ -1,285 +1,214 @@
-import argparse
-import math
-import os
-import threading
-import time
-from typing import List, Optional, Tuple
-
 import cv2
+import torch
+import time
 import numpy as np
-
-try:
-    from ultralytics import YOLO
-except ImportError:  # pragma: no cover - optional dependency
-    YOLO = None
-
-try:
-    import tflite_runtime.interpreter as tflite
-except ImportError:  # pragma: no cover - optional dependency
-    tflite = None
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+from tqdm import tqdm
 
 
-MIDAS_MODEL_PATH = "midas_v2_1_small.tflite"
-YOLO_MODEL_PATH = "yolo11n.pt"
+# ---------------- Device setup (auto CPU/GPU, no hardcoding) ----------------
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+device_index = 0 if torch.cuda.is_available() else "cpu"  # for YOLO's predict(device=...)
+print(f"[INFO] Using device: {device}")
 
-# Tuning dials for UAV altitude calibration
-CROWD_THRESHOLD = 4
-SPATIAL_RADIUS = 150
-DEPTH_WEIGHT = 2.0
+# ---------------- Load MiDaS model ----------------
+# Use MiDaS_small for edge/UAV deployment (much faster than DPT_Hybrid/DPT_Large)
+model_type = "MiDaS_small"
+# model_type = "DPT_Hybrid"
+# model_type = "DPT_Large"
+midas = torch.hub.load("intel-isl/MiDaS", model_type)
+midas.to(device)
+midas.eval()
 
+# Load MiDaS transforms (small model uses the "small_transform", not dpt_transform)
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+if model_type == "MiDaS_small":
+    transform = midas_transforms.small_transform
+else:
+    transform = midas_transforms.dpt_transform
 
-class PersonDetector:
-    """Wraps YOLO if available, otherwise falls back to OpenCV HOG."""
+# ---------------- Load YOLO model ONCE (was reloaded every frame — fixed) ----------------
+model = YOLO('yolov8n.pt')  # nano detection model (lighter than seg model, no masks needed for counting)
+PERSON_CLASS_ID = 0  # COCO class 0 = person
 
-    def __init__(self, model_path: str):
-        self.model = None
-        self.hog = None
-        self.model_path = model_path
+# ---------------- Video source ----------------
+# For a live webcam feed:
+video_path = 0
+# For a drone RTSP stream, use something like:
+# video_path = "rtsp://<drone-ip>:<port>/stream"
+# For a local video file:
+# video_path = "path/to/your_video.mp4"
 
-        if YOLO is not None and os.path.exists(model_path):
-            self.model = YOLO(model_path)
-        elif YOLO is not None:
-            self.model = YOLO("yolo11n.pt") if os.path.exists("yolo11n.pt") else None
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    raise RuntimeError(f"Could not open video source: {video_path}")
 
-        if self.model is None:
-            self.hog = cv2.HOGDescriptor()
-            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+# Output video file
+output_video_path = 'output_depth_headcount.mp4'
 
-    def detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        if self.model is not None:
-            try:
-                results = self.model(frame, classes=[0], conf=0.35, imgsz=640, stream=False, verbose=False)
-                boxes = []
-                for box in results[0].boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    boxes.append((x1, y1, max(1, x2 - x1), max(1, y2 - y1)))
-                return boxes
-            except Exception:
-                pass
-
-        if self.hog is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            boxes, _ = self.hog.detectMultiScale(
-                gray,
-                winStride=(8, 8),
-                padding=(8, 8),
-                scale=1.05,
-            )
-            return [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in boxes]
-
-        return []
+# Video settings
+fps_in = cap.get(cv2.CAP_PROP_FPS)
+fps_in = fps_in if fps_in and fps_in > 0 else 20  # webcams often report 0 fps
+frame_width = int(cap.get(3))
+frame_height = int(cap.get(4))
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(output_video_path, fourcc, fps_in, (frame_width, frame_height))
 
 
-class DepthEstimatorThread(threading.Thread):
-    def __init__(self, model_path: str):
-        super().__init__(daemon=True)
-        self.model_path = model_path
-        self.interpreter = None
-        self.input_details = None
-        self.output_details = None
-        self.current_frame: Optional[np.ndarray] = None
-        self.latest_depth_map: Optional[np.ndarray] = None
-        self.lock = threading.Lock()
-        self.use_simulation = True
+def picture_in_picture(main_image, overlay_image, img_ratio=3, border_size=3, x_margin=30, y_offset_adjust=-100):
+    """
+    Overlay an image onto a main image with a white border.
+    """
+    if main_image is None or overlay_image is None:
+        raise FileNotFoundError("One or both images not found.")
 
-        if tflite is not None and os.path.exists(model_path):
-            try:
-                self.interpreter = tflite.Interpreter(model_path=model_path)
-                self.interpreter.allocate_tensors()
-                self.input_details = self.interpreter.get_input_details()
-                self.output_details = self.interpreter.get_output_details()
-                self.use_simulation = False
-            except Exception:
-                self.interpreter = None
+    new_height = main_image.shape[0] // img_ratio
+    new_width = int(new_height * (overlay_image.shape[1] / overlay_image.shape[0]))
+    overlay_resized = cv2.resize(overlay_image, (new_width, new_height))
 
-    def _simulate_depth(self, frame: np.ndarray) -> np.ndarray:
-        h, w = frame.shape[:2]
-        yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-        center_x, center_y = w / 2.0, h / 2.0
-        distance = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
-        depth = (255 - np.clip(distance / 4.0, 0, 255)).astype(np.uint8)
-        return depth
+    overlay_with_border = cv2.copyMakeBorder(
+        overlay_resized,
+        border_size, border_size, border_size, border_size,
+        cv2.BORDER_CONSTANT, value=[255, 255, 255]
+    )
 
-    def run(self) -> None:
-        while True:
-            with self.lock:
-                frame_to_process = self.current_frame.copy() if self.current_frame is not None else None
+    x_offset = main_image.shape[1] - overlay_with_border.shape[1] - x_margin
+    y_offset = (main_image.shape[0] // 2) - overlay_with_border.shape[0] + y_offset_adjust
 
-            if frame_to_process is not None:
-                if self.use_simulation:
-                    depth_map = self._simulate_depth(frame_to_process)
-                else:
-                    input_shape = self.input_details[0]["shape"]
-                    input_size = (input_shape[1], input_shape[2])
-                    img = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, input_size)
-                    img = img.astype(np.float32) / 255.0
-                    img = np.expand_dims(img, axis=0)
+    main_image[y_offset:y_offset + overlay_with_border.shape[0],
+               x_offset:x_offset + overlay_with_border.shape[1]] = overlay_with_border
 
-                    self.interpreter.set_tensor(self.input_details[0]["index"], img)
-                    self.interpreter.invoke()
-                    depth_output = self.interpreter.get_tensor(self.output_details[0]["index"])[0]
-                    depth_min = depth_output.min()
-                    depth_max = depth_output.max()
-                    if depth_max == depth_min:
-                        depth_map = np.zeros(frame_to_process.shape[:2], dtype=np.uint8)
-                    else:
-                        depth_map = ((255 * (depth_output - depth_min) / (depth_max - depth_min)).astype("uint8"))
-                        h, w = frame_to_process.shape[:2]
-                        depth_map = cv2.resize(depth_map, (w, h), interpolation=cv2.INTER_CUBIC)
-
-                with self.lock:
-                    self.latest_depth_map = depth_map
-
-            time.sleep(0.05)
+    return main_image
 
 
-def calculate_spatial_density(
-    pedestrians: List[Tuple[int, int, int, int]],
-    depth_map: Optional[np.ndarray],
-    crowd_threshold: int = CROWD_THRESHOLD,
-    spatial_radius: int = SPATIAL_RADIUS,
-    depth_weight: float = DEPTH_WEIGHT,
-) -> Tuple[bool, List[Tuple[int, int, int, int]]]:
-    """Return whether the scene is crowded and which boxes are implicated."""
-    if not pedestrians or depth_map is None:
-        return False, []
+# Variables for FPS calculation
+frameId = 0
+start_time = time.time()
+fps_display = str()
 
-    points_3d = []
-    for x, y, w, h in pedestrians:
-        cx = int(x + w / 2)
-        cy = int(y + h / 2)
-        cx = max(0, min(cx, depth_map.shape[1] - 1))
-        cy = max(0, min(cy, depth_map.shape[0] - 1))
-        z = float(depth_map[cy, cx])
-        points_3d.append((cx, cy, z, (x, y, w, h)))
+# total_frames may be 0/unreliable for live streams — guard the progress bar
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+use_progress_bar = total_frames > 0
+progress_bar = tqdm(total=total_frames, desc="Processing Frames", unit="frame") if use_progress_bar else None
 
-    crowded_bboxes = []
-    for i, (x1, y1, z1, bbox1) in enumerate(points_3d):
-        neighbors = 0
-        for j, (x2, y2, z2, _) in enumerate(points_3d):
-            if i == j:
+while True:
+    frameId += 1
+
+    ret, frame = cap.read()
+    if not ret:
+        break
+    img = frame.copy()
+    image = frame.copy()
+
+    # Transform the image for MiDaS
+    input_batch = transform(img).to(device)
+
+    interpolation_mode = 'bilinear'
+
+    # Run MiDaS Depth
+    with torch.no_grad():
+        prediction = midas(input_batch)
+        prediction = torch.nn.functional.interpolate(
+            prediction.unsqueeze(1),
+            size=img.shape[:2],
+            mode=interpolation_mode,
+            align_corners=False,
+        ).squeeze()
+    depth_map = prediction.cpu().numpy()
+    depth_map_normalized = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+    depth_map = 1.0 - depth_map_normalized
+
+    # ---------------- Run YOLO Detector (person-only, model loaded once above) ----------------
+    image = img.copy()
+    results = model.predict(image, verbose=False, device=device_index, classes=[PERSON_CLASS_ID])
+
+    head_count = 0
+
+    for predictions in results:
+        if predictions is None or predictions.boxes is None:
+            continue
+
+        head_count = len(predictions.boxes)  # number of people detected this frame
+
+        for bbox in predictions.boxes:
+            scores = bbox.conf[0]
+            classes = bbox.cls[0]
+            bbox_coords = bbox.xyxy[0]
+
+            xmin = bbox_coords[0]
+            ymin = bbox_coords[1]
+            xmax = bbox_coords[2]
+            ymax = bbox_coords[3]
+            cv2.rectangle(image, (int(xmin), int(ymin)), (int(xmax), int(ymax)), (0, 0, 225), 2)
+
+            # Get the depth values within the bounding box
+            depth_values_bbox = depth_map[int(ymin):int(ymax), int(xmin):int(xmax)]
+            if depth_values_bbox.size == 0:
                 continue
-            dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (depth_weight * (z2 - z1)) ** 2)
-            if dist < spatial_radius:
-                neighbors += 1
-        if neighbors >= crowd_threshold:
-            crowded_bboxes.append(bbox1)
+            depth_value = np.median(depth_values_bbox)
 
-    return bool(crowded_bboxes), crowded_bboxes
+            # Relative distance estimate (NOT calibrated metric distance — MiDaS is relative depth)
+            scale_factor = 15
+            distance = depth_value * scale_factor
 
+            overlay_frame = image.copy()
+            font_scale = 0.4
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_color = (255, 255, 255)
+            background_color = (30, 30, 30)
+            line_spacing = int(15 * font_scale)
+            text_x = int(xmin) + 5
+            text_y = int(ymin) + 5
 
-def build_demo_frame(frame_idx: int) -> np.ndarray:
-    frame = np.full((480, 640, 3), (40, 55, 80), dtype=np.uint8)
-    for idx in range(8):
-        x = 70 + (idx * 65 + frame_idx * 4) % 430
-        y = 120 + (idx % 3) * 85
-        cv2.rectangle(frame, (x, y), (x + 35, y + 70), (40, 180, 255), -1)
-        cv2.circle(frame, (x + 18, y + 24), 12, (255, 255, 255), -1)
-    return frame
+            text_lines = [
+                str(predictions.names[int(classes)]),
+                str(round(float(scores) * 100, 1)) + '%',
+                f'Dist: {distance:.3f} (rel)'
+            ]
+            text_sizes = [cv2.getTextSize(line, font, font_scale, 1)[0] for line in text_lines]
+            max_width = max(w for w, h in text_sizes) + 3
+            total_height = sum(h for w, h in text_sizes) + (len(text_lines) - 1) * line_spacing + 3
 
+            cv2.rectangle(image, (text_x - 5, text_y - text_sizes[0][1] - 5),
+                          (text_x + max_width, text_y + total_height - 5),
+                          background_color, cv2.FILLED)
 
-def annotate_frame(
-    frame: np.ndarray,
-    pedestrians: List[Tuple[int, int, int, int]],
-    crowded_boxes: List[Tuple[int, int, int, int]],
-    is_crowded: bool,
-) -> np.ndarray:
-    for x, y, w, h in pedestrians:
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    for x, y, w, h in crowded_boxes:
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            for i, line in enumerate(text_lines):
+                line_y = text_y + i * (text_sizes[i][1] + line_spacing)
+                cv2.putText(image, line, (text_x, line_y), font, font_scale, font_color, 1)
 
-    cv2.putText(frame, f"Headcount: {len(pedestrians)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    if is_crowded:
-        cv2.putText(frame, "ALERT: CROWDED (HIGH SPATIAL DENSITY)", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
-    return frame
+            image = cv2.addWeighted(overlay_frame, 0.5, image, 0.5, 0)
 
+    # ---------------- FPS calculation ----------------
+    if frameId % 10 == 0:
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        fps_current = 10 / elapsed_time if elapsed_time > 0 else 0
+        fps_display = f'FPS: {fps_current:.2f}'
+        start_time = time.time()
 
-def run_pipeline(args: argparse.Namespace) -> None:
-    detector = PersonDetector(args.yolo_model)
-    depth_thread = DepthEstimatorThread(args.midas_model)
-    depth_thread.start()
+    # Depth map visualization (picture-in-picture)
+    depth_map_colored = plt.cm.plasma(depth_map / depth_map.max())[:, :, :3]
+    depth_map_colored = (depth_map_colored * 255).astype(np.uint8)
+    image = picture_in_picture(image, depth_map_colored)
 
-    if args.source.lower() == "demo":
-        cap = None
-        frame_idx = 0
-    else:
-        if args.source.isdigit():
-            source = int(args.source)
-        else:
-            source = args.source
-        cap = cv2.VideoCapture(source)
-        if not cap.isOpened():
-            raise RuntimeError(f"Unable to open video source: {args.source}")
+    # Overlay FPS and head count
+    cv2.putText(image, fps_display, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(image, f'Head Count: {head_count}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-    writer = None
-    if args.output:
-        out_dir = os.path.dirname(args.output)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (640, 480))
+    cv2.imshow('UAV Crowd Analytics - YOLO + MiDaS', image)
+    out.write(image)
 
-    frame_count = 0
-    while True:
-        if cap is None:
-            frame = build_demo_frame(frame_idx)
-            frame_idx += 1
-        else:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-        with depth_thread.lock:
-            depth_thread.current_frame = frame
-            current_depth_map = depth_thread.latest_depth_map
+    if use_progress_bar:
+        progress_bar.update(1)
 
-        pedestrians = detector.detect(frame)
-        is_crowded, crowded_boxes = calculate_spatial_density(pedestrians, current_depth_map)
-        frame = annotate_frame(frame, pedestrians, crowded_boxes, is_crowded)
+if use_progress_bar:
+    progress_bar.close()
 
-        if current_depth_map is not None:
-            depth_colormap = cv2.applyColorMap(current_depth_map, cv2.COLORMAP_JET)
-            pip_w, pip_h = int(frame.shape[1] / 3), int(frame.shape[0] / 3)
-            depth_pip = cv2.resize(depth_colormap, (pip_w, pip_h))
-            frame[0:pip_h, frame.shape[1] - pip_w:frame.shape[1]] = depth_pip
-
-        if writer is not None:
-            writer.write(frame)
-
-        if not args.no_display:
-            cv2.imshow("Edge UAV Crowd Analytics", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-        frame_count += 1
-        if args.max_frames and frame_count >= args.max_frames:
-            break
-
-    if cap is not None:
-        cap.release()
-    if writer is not None:
-        writer.release()
-    if not args.no_display:
-        cv2.destroyAllWindows()
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Edge-based UAV crowd analytics with YOLO and MiDaS")
-    parser.add_argument("--source", default="0", help="Camera index, video path, or 'demo'")
-    parser.add_argument("--yolo-model", default=YOLO_MODEL_PATH, help="Path to YOLO weights (.pt)")
-    parser.add_argument("--midas-model", default=MIDAS_MODEL_PATH, help="Path to MiDaS TFLite model")
-    parser.add_argument("--output", default="", help="Optional output video file")
-    parser.add_argument("--max-frames", type=int, default=0, help="Stop after this many frames")
-    parser.add_argument("--no-display", action="store_true", help="Disable the video display window")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    print("[INFO] Starting Edge UAV Crowd Analytics")
-    run_pipeline(args)
-
-
-if __name__ == "__main__":
-    main()
+cap.release()
+out.release()
+cv2.destroyAllWindows()
